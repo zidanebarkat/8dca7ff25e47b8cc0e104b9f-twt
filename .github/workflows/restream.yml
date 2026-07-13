@@ -8,21 +8,6 @@ on:
       output_url:
         description: RTMP/SRT URL
         required: true
-      fallback_video:
-        description: Fallback Video URL
-        required: false
-        default: 'https://cdn.pixabay.com/video/2025/10/23/311602_large.mp4'
-      fallback_playlist:
-        description: Fallback Music Playlist
-        required: false
-        default: |-
-          https://files.freemusicarchive.org/storage-freemusicarchive-org/tracks/yFLu7P69mDjxhW2aF5MS16GVCqpw4oCqSKw4eSVN.mp3
-          https://files.freemusicarchive.org/storage-freemusicarchive-org/tracks/Djej42Pty0GrF6VFUNzYPDxsuhCwgWzF9ZHWFsZY.mp3
-          https://files.freemusicarchive.org/storage-freemusicarchive-org/tracks/3CujPNW3YlSqNkWQSgsgysHBl1YPOXRsqBTX2gh0.mp3
-          https://files.freemusicarchive.org/storage-freemusicarchive-org/tracks/hMRyjksozJqHXKTqLJLjhV9dVMNMywBPJIGhzEFh.mp3
-          https://files.freemusicarchive.org/storage-freemusicarchive-org/tracks/Lq2CptklJpFylGJ8xFTGf9Ao6wzrNu6qkZY1wmgb.mp3
-          https://files.freemusicarchive.org/storage-freemusicarchive-org/tracks/I0x2w0gQdIqJ8WX6qkbn2j7OPWZhJqsncWBvOaf7.mp3
-          https://files.freemusicarchive.org/storage-freemusicarchive-org/tracks/wUFY7RnCiQIfvL3FAlyKRifL7wxYF4LN6Trb6aOh.mp3
       overlay_text:
         description: Overlay text on video
         required: false
@@ -123,8 +108,7 @@ jobs:
               echo "live=true" >> "$GITHUB_OUTPUT"
               echo "Downloaded video: $(ls -lh source_video.mp4 | awk '{print $5}')"
             else
-              echo "live=false" >> "$GITHUB_OUTPUT"
-              echo "ERROR: Failed to resolve or download source"
+              echo "ERROR: Source not live and download failed. Nothing to stream."
               exit 1
             fi
           fi
@@ -140,33 +124,38 @@ jobs:
       - name: Schedule self-reboot (before 6h limit)
         if: inputs.github_token != '' && inputs.preview != 'true'
         run: |
-          (sleep 21000 && curl -s -X POST \
-            -H "Authorization: Bearer ${{ inputs.github_token }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/restream.yml/dispatches" \
-            -d '{"ref":"main","inputs":{
-              "source_url":"${{ inputs.source_url }}",
-              "output_url":"${{ inputs.output_url }}",
-              "overlay_text":"${{ inputs.overlay_text }}",
-              "browser_overlay_url":"${{ inputs.browser_overlay_url }}",
-              "cookies_b64":"${{ inputs.cookies_b64 }}",
-              "fallback_video":"${{ inputs.fallback_video }}",
-              "fallback_playlist":"${{ inputs.fallback_playlist }}",
-              "github_token":"${{ inputs.github_token }}"
-            }}') &
+          (sleep 19800 && for i in 1 2 3; do
+            echo "Self-reboot attempt $i at $(date)..."
+            RESP=$(curl -s -X POST \
+              -H "Authorization: Bearer ${{ inputs.github_token }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/restream.yml/dispatches" \
+              -d '{"ref":"main","inputs":{
+                "source_url":"${{ inputs.source_url }}",
+                "output_url":"${{ inputs.output_url }}",
+                "overlay_text":"${{ inputs.overlay_text }}",
+                "browser_overlay_url":"${{ inputs.browser_overlay_url }}",
+                "cookies_b64":"${{ inputs.cookies_b64 }}",
+                "github_token":"${{ inputs.github_token }}"
+              }}')
+            echo "$RESP"
+            if echo "$RESP" | grep -q '"id"'; then
+              echo "Self-reboot triggered successfully"
+              break
+            fi
+            sleep 30
+          done) &
 
-      - name: Fallback restream
-        if: steps.resolve.outputs.live != 'true'
-        env:
-          OT: ${{ inputs.overlay_text }}
+      - name: Restream (downloaded video)
+        if: steps.resolve.outputs.mode == 'download' && inputs.preview != 'true'
         run: |
           BEVELED=$(cat /tmp/beveled.txt)
-          echo "[0:v]scale=1280:720,$BEVELED[main];[2:v]format=rgba[ov];[main][ov]overlay=20:main_h-overlay_h-20:format=auto[out]" > /tmp/vf.txt
-          FONT="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
           URL="${{ inputs.output_url }}"
+          echo "[0:v]scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease,$BEVELED[main];[1:v]format=rgba[ov];[main][ov]overlay=20:main_h-overlay_h-20:format=auto[out]" > /tmp/vf.txt
           while true; do
-            ffmpeg -nostdin -re -stream_loop -1 -i brb.mp4 -f concat -safe 0 -i concat.txt -f rawvideo -pix_fmt rgba -s 400x600 -r 5 -i /tmp/chat_overlay.fifo \
-              -filter_complex_script /tmp/vf.txt -map '[out]' -map 1:a \
+            ffmpeg -nostdin -re -stream_loop -1 -i source_video.mp4 \
+              -f rawvideo -pix_fmt rgba -s 400x600 -r 5 -i /tmp/chat_overlay.fifo \
+              -filter_complex_script /tmp/vf.txt -map '[out]' -map 0:a \
               -c:v libx264 -preset ultrafast -b:v 1500k -c:a aac -b:a 96k \
               -shortest -bufsize 3000k -maxrate 1500k -g 60 -pix_fmt yuv420p \
               -f flv "$URL" || true
@@ -174,51 +163,70 @@ jobs:
             sleep 10
           done
 
-      - name: Live restream
-        if: steps.resolve.outputs.live == 'true'
-        env:
-          OT: ${{ inputs.overlay_text }}
+      - name: Restream (live HLS)
+        if: steps.resolve.outputs.mode == 'stream' && inputs.preview != 'true'
         run: |
           BEVELED=$(cat /tmp/beveled.txt)
           URL="${{ inputs.output_url }}"
-          MODE="${{ steps.resolve.outputs.mode }}"
-          if [ "$MODE" = "download" ]; then
-            echo "[0:v]scale=1280:720,$BEVELED[main];[1:v]format=rgba[ov];[main][ov]overlay=20:main_h-overlay_h-20:format=auto[out]" > /tmp/vf.txt
+          HAS_AUDIO="${{ steps.resolve.outputs.has_separate_audio }}"
+          if [ "$HAS_AUDIO" = "true" ]; then
+            echo "[0:v]scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease,$BEVELED[main];[2:v]format=rgba[ov];[main][ov]overlay=20:main_h-overlay_h-20:format=auto[out]" > /tmp/vf.txt
             while true; do
-              ffmpeg -nostdin -re -stream_loop -1 -i source_video.mp4 \
+              ffmpeg -nostdin -re -i "${{ steps.resolve.outputs.video_url }}" -i "${{ steps.resolve.outputs.audio_url }}" \
                 -f rawvideo -pix_fmt rgba -s 400x600 -r 5 -i /tmp/chat_overlay.fifo \
-                -filter_complex_script /tmp/vf.txt -map '[out]' -map 0:a \
+                -filter_complex_script /tmp/vf.txt -map '[out]' -map 1:a \
                 -c:v libx264 -preset ultrafast -b:v 1500k -c:a aac -b:a 96k \
-                -shortest -bufsize 3000k -maxrate 1500k -g 60 -pix_fmt yuv420p \
+                -bufsize 3000k -maxrate 1500k -g 60 -pix_fmt yuv420p \
                 -f flv "$URL" || true
               echo "Restream died, restarting in 10s..."
               sleep 10
             done
           else
-            HAS_AUDIO="${{ steps.resolve.outputs.has_separate_audio }}"
-            if [ "$HAS_AUDIO" = "true" ]; then
-          echo "[0:v]scale=1280:720,$BEVELED[main];[2:v]format=rgba[ov];[main][ov]overlay=20:main_h-overlay_h-20:format=auto[out]" > /tmp/vf.txt
-              while true; do
-                ffmpeg -nostdin -re -i "${{ steps.resolve.outputs.video_url }}" -i "${{ steps.resolve.outputs.audio_url }}" \
-                  -f rawvideo -pix_fmt rgba -s 400x600 -r 5 -i /tmp/chat_overlay.fifo \
-                  -filter_complex_script /tmp/vf.txt -map '[out]' -map 1:a \
-                  -c:v libx264 -preset ultrafast -b:v 1500k -c:a aac -b:a 96k \
-                  -bufsize 3000k -maxrate 1500k -g 60 -pix_fmt yuv420p \
-                  -f flv "$URL" || true
-                echo "Restream died, restarting in 10s..."
-                sleep 10
-              done
-            else
-              echo "[0:v]scale=1280:720,$BEVELED[main];[1:v]format=rgba[ov];[main][ov]overlay=20:main_h-overlay_h-20:format=auto[out]" > /tmp/vf.txt
-              while true; do
-                ffmpeg -nostdin -re -i "${{ steps.resolve.outputs.video_url }}" \
-                  -f rawvideo -pix_fmt rgba -s 400x600 -r 5 -i /tmp/chat_overlay.fifo \
-                  -filter_complex_script /tmp/vf.txt -map '[out]' -map 0:a \
-                  -c:v libx264 -preset ultrafast -b:v 1500k -c:a aac -b:a 96k \
-                  -bufsize 3000k -maxrate 1500k -g 60 -pix_fmt yuv420p \
-                  -f flv "$URL" || true
-                echo "Restream died, restarting in 10s..."
-                sleep 10
-              done
-            fi
+            echo "[0:v]scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease,$BEVELED[main];[1:v]format=rgba[ov];[main][ov]overlay=20:main_h-overlay_h-20:format=auto[out]" > /tmp/vf.txt
+            while true; do
+              ffmpeg -nostdin -re -i "${{ steps.resolve.outputs.video_url }}" \
+                -f rawvideo -pix_fmt rgba -s 400x600 -r 5 -i /tmp/chat_overlay.fifo \
+                -filter_complex_script /tmp/vf.txt -map '[out]' -map 0:a \
+                -c:v libx264 -preset ultrafast -b:v 1500k -c:a aac -b:a 96k \
+                -bufsize 3000k -maxrate 1500k -g 60 -pix_fmt yuv420p \
+                -f flv "$URL" || true
+              echo "Restream died, restarting in 10s..."
+              sleep 10
+            done
+          fi
+
+      - name: Preview (downloaded video)
+        if: steps.resolve.outputs.mode == 'download' && inputs.preview == 'true'
+        run: |
+          BEVELED=$(cat /tmp/beveled.txt)
+          FONT="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+          echo "[0:v]scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease,$BEVELED[main];[1:v]format=rgba[ov];[main][ov]overlay=20:main_h-overlay_h-20:format=auto,format=yuv420p[out];[out]split[mainout][snaptmp];[snaptmp]fps=1/5[snap]" > /tmp/vf.txt
+          ffmpeg -nostdin -re -stream_loop -1 -i source_video.mp4 \
+            -f rawvideo -pix_fmt rgba -s 400x600 -r 5 -i /tmp/chat_overlay.fifo \
+            -filter_complex_script /tmp/vf.txt -map '[mainout]' -map 0:a \
+            -c:v libx264 -preset ultrafast -b:v 1500k -c:a aac -b:a 96k \
+            -shortest -bufsize 3000k -maxrate 1500k -g 60 -pix_fmt yuv420p \
+            -f null - -map '[snap]' -f image2 -update 1 -q:v 5 /tmp/preview_composite.jpg
+
+      - name: Preview (live HLS)
+        if: steps.resolve.outputs.mode == 'stream' && inputs.preview == 'true'
+        run: |
+          BEVELED=$(cat /tmp/beveled.txt)
+          HAS_AUDIO="${{ steps.resolve.outputs.has_separate_audio }}"
+          if [ "$HAS_AUDIO" = "true" ]; then
+            echo "[0:v]scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease,$BEVELED[main];[2:v]format=rgba[ov];[main][ov]overlay=20:main_h-overlay_h-20:format=auto,format=yuv420p[out];[out]split[mainout][snaptmp];[snaptmp]fps=1/5[snap]" > /tmp/vf.txt
+            ffmpeg -nostdin -re -i "${{ steps.resolve.outputs.video_url }}" -i "${{ steps.resolve.outputs.audio_url }}" \
+              -f rawvideo -pix_fmt rgba -s 400x600 -r 5 -i /tmp/chat_overlay.fifo \
+              -filter_complex_script /tmp/vf.txt -map '[mainout]' -map 1:a \
+              -c:v libx264 -preset ultrafast -b:v 1500k -c:a aac -b:a 96k \
+              -bufsize 3000k -maxrate 1500k -g 60 -pix_fmt yuv420p \
+              -f null - -map '[snap]' -f image2 -update 1 -q:v 5 /tmp/preview_composite.jpg
+          else
+            echo "[0:v]scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease,$BEVELED[main];[1:v]format=rgba[ov];[main][ov]overlay=20:main_h-overlay_h-20:format=auto,format=yuv420p[out];[out]split[mainout][snaptmp];[snaptmp]fps=1/5[snap]" > /tmp/vf.txt
+            ffmpeg -nostdin -re -i "${{ steps.resolve.outputs.video_url }}" \
+              -f rawvideo -pix_fmt rgba -s 400x600 -r 5 -i /tmp/chat_overlay.fifo \
+              -filter_complex_script /tmp/vf.txt -map '[mainout]' -map 0:a \
+              -c:v libx264 -preset ultrafast -b:v 1500k -c:a aac -b:a 96k \
+              -bufsize 3000k -maxrate 1500k -g 60 -pix_fmt yuv420p \
+              -f null - -map '[snap]' -f image2 -update 1 -q:v 5 /tmp/preview_composite.jpg
           fi
