@@ -27,10 +27,6 @@ on:
         description: Overlay text on video
         required: false
         default: ''
-      browser_overlay_url:
-        description: Browser overlay URL (chat, alerts, etc.)
-        required: false
-        default: ''
       cookies_b64:
         description: Base64-encoded cookies.txt for YouTube sources
         required: false
@@ -48,16 +44,14 @@ jobs:
   stream:
     runs-on: ubuntu-latest
     timeout-minutes: 360
-    env:
-      PREVIEW: ${{ inputs.preview }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install deps
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends ffmpeg build-essential libssl-dev fonts-dejavu-core curl unzip
-          pip install -q yt-dlp curl_cffi websocket-client pillow
+          sudo apt-get install -y -qq --no-install-recommends ffmpeg fonts-dejavu-core curl unzip
+          pip install -q yt-dlp curl_cffi
           curl -fsSL https://deno.land/install.sh | sh || true
           echo "$HOME/.deno/bin" >> $GITHUB_PATH
 
@@ -71,6 +65,19 @@ jobs:
             echo "COOKIES=" >> $GITHUB_ENV
             echo "No cookies provided, trying without"
           fi
+
+      - name: Write overlay filter script
+        run: |
+          FONT="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+          cat > /tmp/beveled.txt << 'FILTEREOF'
+          drawtext=textfile=overlay.txt:reload=1:fontfile=FONT_PLACEHOLDER:fontsize=h*0.05:fontcolor=0x1a0b2e:x=(w-text_w)/2+5:y=(h-text_h)/2+5,drawtext=textfile=overlay.txt:reload=1:fontfile=FONT_PLACEHOLDER:fontsize=h*0.05:fontcolor=0x3a1f5e:x=(w-text_w)/2+3:y=(h-text_h)/2+3,drawtext=textfile=overlay.txt:reload=1:fontfile=FONT_PLACEHOLDER:fontsize=h*0.05:fontcolor=0x6b3f96:x=(w-text_w)/2+1:y=(h-text_h)/2+1,drawtext=textfile=overlay.txt:reload=1:fontfile=FONT_PLACEHOLDER:fontsize=h*0.05:fontcolor=0xC9A2FF:box=1:boxcolor=0x0a0512@0.6:boxborderw=26:bordercolor=0x1a0b2e:borderw=2:x=(w-text_w)/2:y=(h-text_h)/2:shadowcolor=black@0.85:shadowx=6:shadowy=6
+          FILTEREOF
+          sed -i "s|FONT_PLACEHOLDER|$FONT|g" /tmp/beveled.txt
+
+      - name: Create chat FIFO
+        run: |
+          mkfifo /tmp/chat_overlay.fifo 2>/dev/null || true
+          (while true; do dd if=/dev/zero bs=960000 count=1 2>/dev/null > /tmp/chat_overlay.fifo; done) &
 
       - name: Resolve source
         id: resolve
@@ -111,7 +118,6 @@ jobs:
 
       - name: Overlay text updater
         run: |
-          FONT="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
           echo "${{ inputs.overlay_text }}" > overlay.txt
           (while true; do
             curl -s "https://strwithgit.pythonanywhere.com/config" | python3 -c "import sys,json; print(json.load(sys.stdin).get('overlay_text',''))" > overlay.txt 2>/dev/null || true
@@ -129,108 +135,76 @@ jobs:
               "source_url":"${{ inputs.source_url }}",
               "output_url":"${{ inputs.output_url }}",
               "overlay_text":"${{ inputs.overlay_text }}",
-              "browser_overlay_url":"${{ inputs.browser_overlay_url }}",
+              "cookies_b64":"${{ inputs.cookies_b64 }}",
               "fallback_video":"${{ inputs.fallback_video }}",
               "fallback_playlist":"${{ inputs.fallback_playlist }}",
-              "cookies_b64":"${{ inputs.cookies_b64 }}",
               "github_token":"${{ inputs.github_token }}"
             }}') &
 
-      - name: Fallback restream (preview)
-        if: steps.resolve.outputs.live != 'true' && inputs.preview == 'true'
+      - name: Fallback restream
+        if: steps.resolve.outputs.live != 'true'
         env:
           OT: ${{ inputs.overlay_text }}
         run: |
+          BEVELED=$(cat /tmp/beveled.txt)
+          echo "[0:v]scale=1280:720,$BEVELED[main];[2:v]format=rgba[ov];[main][ov]overlay=20:main_h-overlay_h-20:format=auto[out]" > /tmp/vf.txt
           FONT="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-          BEVELED="drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0x1a0b2e:x=(w-text_w)/2+5:y=(h-text_h)/2+5,drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0x3a1f5e:x=(w-text_w)/2+3:y=(h-text_h)/2+3,drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0x6b3f96:x=(w-text_w)/2+1:y=(h-text_h)/2+1,drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0xC9A2FF:box=1:boxcolor=0x0a0512@0.6:boxborderw=26:bordercolor=0x1a0b2e:borderw=2:x=(w-text_w)/2:y=(h-text_h)/2:shadowcolor=black@0.85:shadowx=6:shadowy=6"
-          VF="[0:v]scale=1920:1080,$BEVELED[main];[2:v]format=rgba[ov];[main][ov]overlay=20:main_h-overlay_h-20:format=auto[out];[out]split[mainout][snaptmp];[snaptmp]fps=1/5[snap]"
-          (while true; do
-            if [ -f /tmp/preview_composite.jpg ]; then
-              curl -s -X POST -F "frame=@/tmp/preview_composite.jpg" "https://strwithgit.pythonanywhere.com/preview_frame_upload" >/dev/null 2>&1 || true
-            fi
-            sleep 3
-          done) &
-          ffmpeg -nostdin -re -stream_loop -1 -i brb.mp4 -f concat -safe 0 -i concat.txt -f rawvideo -pix_fmt rgba -s 400x600 -r 5 -i /tmp/chat_overlay.fifo -filter_complex "$VF" -map '[mainout]' -map 1:a -c:v libx264 -preset ultrafast -b:v 2000k -c:a aac -b:a 96k -shortest -bufsize 4000k -maxrate 2000k -g 60 -f null - -map '[snap]' -f image2 -update 1 -q:v 5 /tmp/preview_composite.jpg
-
-      - name: Fallback restream (live)
-        if: steps.resolve.outputs.live != 'true' && inputs.preview != 'true'
-        env:
-          OT: ${{ inputs.overlay_text }}
-        run: |
-          FONT="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-          BEVELED="drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0x1a0b2e:x=(w-text_w)/2+5:y=(h-text_h)/2+5,drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0x3a1f5e:x=(w-text_w)/2+3:y=(h-text_h)/2+3,drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0x6b3f96:x=(w-text_w)/2+1:y=(h-text_h)/2+1,drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0xC9A2FF:box=1:boxcolor=0x0a0512@0.6:boxborderw=26:bordercolor=0x1a0b2e:borderw=2:x=(w-text_w)/2:y=(h-text_h)/2:shadowcolor=black@0.85:shadowx=6:shadowy=6"
-          VF="[0:v]scale=1920:1080,$BEVELED[main];[2:v]format=rgba[ov];[main][ov]overlay=20:main_h-overlay_h-20:format=auto[out]"
-          CMD="ffmpeg -nostdin -re -stream_loop -1 -i brb.mp4 -f concat -safe 0 -i concat.txt -f rawvideo -pix_fmt rgba -s 400x600 -r 5 -i /tmp/chat_overlay.fifo -filter_complex \"$VF\" -map '[out]' -map 1:a -c:v libx264 -preset ultrafast -b:v 2000k -c:a aac -b:a 96k -shortest -bufsize 4000k -maxrate 2000k -g 60 -pix_fmt yuv420p"
           URL="${{ inputs.output_url }}"
-          if [[ "$URL" == srt://* ]]; then
-            CMD="$CMD -f mpegts \"$URL\""
-          else
-            CMD="$CMD -f flv \"$URL\""
-          fi
           while true; do
-            eval "$CMD" || true
+            ffmpeg -nostdin -re -stream_loop -1 -i brb.mp4 -f concat -safe 0 -i concat.txt -f rawvideo -pix_fmt rgba -s 400x600 -r 5 -i /tmp/chat_overlay.fifo \
+              -filter_complex_script /tmp/vf.txt -map '[out]' -map 1:a \
+              -c:v libx264 -preset ultrafast -b:v 1500k -c:a aac -b:a 96k \
+              -shortest -bufsize 3000k -maxrate 1500k -g 60 -pix_fmt yuv420p \
+              -f flv "$URL" || true
             echo "Restream died, restarting in 10s..."
             sleep 10
           done
 
-      - name: Live restream (preview)
-        if: steps.resolve.outputs.live == 'true' && inputs.preview == 'true'
+      - name: Live restream
+        if: steps.resolve.outputs.live == 'true'
         env:
           OT: ${{ inputs.overlay_text }}
         run: |
-          FONT="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-          PWL="file,http,https,tcp,tls,crypto,srt,rtmp,rtmps"
-          BEVELED="drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0x1a0b2e:x=(w-text_w)/2+5:y=(h-text_h)/2+5,drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0x3a1f5e:x=(w-text_w)/2+3:y=(h-text_h)/2+3,drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0x6b3f96:x=(w-text_w)/2+1:y=(h-text_h)/2+1,drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0xC9A2FF:box=1:boxcolor=0x0a0512@0.6:boxborderw=26:bordercolor=0x1a0b2e:borderw=2:x=(w-text_w)/2:y=(h-text_h)/2:shadowcolor=black@0.85:shadowx=6:shadowy=6"
-          VF="[0:v]$BEVELED[main];[1:v]format=rgba[ov];[main][ov]overlay=20:main_h-overlay_h-20:format=auto[out];[out]split[mainout][snaptmp];[snaptmp]fps=1/5[snap]"
-          (while true; do
-            if [ -f /tmp/preview_composite.jpg ]; then
-              curl -s -X POST -F "frame=@/tmp/preview_composite.jpg" "https://strwithgit.pythonanywhere.com/preview_frame_upload" >/dev/null 2>&1 || true
-            fi
-            sleep 3
-          done) &
-          MODE="${{ steps.resolve.outputs.mode }}"
-          if [ "$MODE" = "download" ]; then
-            ffmpeg -nostdin -re -stream_loop -1 -i source_video.mp4 -f rawvideo -pix_fmt rgba -s 400x600 -r 5 -i /tmp/chat_overlay.fifo -filter_complex "$VF" -map '[mainout]' -map 0:a -c:v libx264 -preset ultrafast -b:v 2000k -c:a aac -b:a 96k -bufsize 4000k -maxrate 2000k -g 60 -f null - -map '[snap]' -f image2 -update 1 -q:v 5 /tmp/preview_composite.jpg
-          else
-            HAS_AUDIO="${{ steps.resolve.outputs.has_separate_audio }}"
-            if [ "$HAS_AUDIO" = "true" ]; then
-              ffmpeg -nostdin -re -protocol_whitelist "$PWL" -fflags +discardcorrupt -timeout 30000000 -i "${{ steps.resolve.outputs.video_url }}" -i "${{ steps.resolve.outputs.audio_url }}" -f rawvideo -pix_fmt rgba -s 400x600 -r 5 -i /tmp/chat_overlay.fifo -filter_complex "$VF" -map '[mainout]' -map 1:a -c:v libx264 -preset ultrafast -b:v 2000k -c:a aac -b:a 96k -bufsize 4000k -maxrate 2000k -g 60 -f null - -map '[snap]' -f image2 -update 1 -q:v 5 /tmp/preview_composite.jpg
-            else
-              ffmpeg -nostdin -re -protocol_whitelist "$PWL" -fflags +discardcorrupt -timeout 30000000 -i "${{ steps.resolve.outputs.video_url }}" -f rawvideo -pix_fmt rgba -s 400x600 -r 5 -i /tmp/chat_overlay.fifo -filter_complex "$VF" -map '[mainout]' -map 0:a -c:v libx264 -preset ultrafast -b:v 2000k -c:a aac -b:a 96k -bufsize 4000k -maxrate 2000k -g 60 -f null - -map '[snap]' -f image2 -update 1 -q:v 5 /tmp/preview_composite.jpg
-            fi
-          fi
-
-      - name: Live restream (live)
-        if: steps.resolve.outputs.live == 'true' && inputs.preview != 'true'
-        env:
-          OT: ${{ inputs.overlay_text }}
-        run: |
-          FONT="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-          PWL="file,http,https,tcp,tls,crypto,srt,rtmp,rtmps"
-          BEVELED="drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0x1a0b2e:x=(w-text_w)/2+5:y=(h-text_h)/2+5,drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0x3a1f5e:x=(w-text_w)/2+3:y=(h-text_h)/2+3,drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0x6b3f96:x=(w-text_w)/2+1:y=(h-text_h)/2+1,drawtext=textfile=overlay.txt:reload=1:fontfile=$FONT:fontsize=h*0.05:fontcolor=0xC9A2FF:box=1:boxcolor=0x0a0512@0.6:boxborderw=26:bordercolor=0x1a0b2e:borderw=2:x=(w-text_w)/2:y=(h-text_h)/2:shadowcolor=black@0.85:shadowx=6:shadowy=6"
+          BEVELED=$(cat /tmp/beveled.txt)
           URL="${{ inputs.output_url }}"
-          if [[ "$URL" == srt://* ]]; then
-            OUTF="mpegts"
-          else
-            OUTF="flv"
-          fi
           MODE="${{ steps.resolve.outputs.mode }}"
           if [ "$MODE" = "download" ]; then
-            VF="[0:v]scale=1920:1080,$BEVELED[main];[1:v]format=rgba[ov];[main][ov]overlay=20:main_h-overlay_h-20:format=auto[out]"
-            CMD="ffmpeg -nostdin -re -stream_loop -1 -i source_video.mp4 -f rawvideo -pix_fmt rgba -s 400x600 -r 5 -i /tmp/chat_overlay.fifo -filter_complex \"$VF\" -map '[out]' -map 0:a -c:v libx264 -preset ultrafast -b:v 2000k -c:a aac -b:a 96k -shortest -bufsize 4000k -maxrate 2000k -g 60 -pix_fmt yuv420p"
+            echo "[0:v]scale=1280:720,$BEVELED[main];[1:v]format=rgba[ov];[main][ov]overlay=20:main_h-overlay_h-20:format=auto[out]" > /tmp/vf.txt
+            while true; do
+              ffmpeg -nostdin -re -stream_loop -1 -i source_video.mp4 \
+                -f rawvideo -pix_fmt rgba -s 400x600 -r 5 -i /tmp/chat_overlay.fifo \
+                -filter_complex_script /tmp/vf.txt -map '[out]' -map 0:a \
+                -c:v libx264 -preset ultrafast -b:v 1500k -c:a aac -b:a 96k \
+                -shortest -bufsize 3000k -maxrate 1500k -g 60 -pix_fmt yuv420p \
+                -f flv "$URL" || true
+              echo "Restream died, restarting in 10s..."
+              sleep 10
+            done
           else
             HAS_AUDIO="${{ steps.resolve.outputs.has_separate_audio }}"
             if [ "$HAS_AUDIO" = "true" ]; then
-              VF="[0:v]$BEVELED[main];[2:v]format=rgba[ov];[main][ov]overlay=20:main_h-overlay_h-20:format=auto[out]"
-              CMD="ffmpeg -nostdin -re -protocol_whitelist \"$PWL\" -fflags +discardcorrupt -timeout 30000000 -i \"${{ steps.resolve.outputs.video_url }}\" -i \"${{ steps.resolve.outputs.audio_url }}\" -f rawvideo -pix_fmt rgba -s 400x600 -r 5 -i /tmp/chat_overlay.fifo -filter_complex \"$VF\" -map '[out]' -map 1:a -c:v libx264 -preset ultrafast -b:v 2000k -c:a aac -b:a 96k -bufsize 4000k -maxrate 2000k -g 60 -pix_fmt yuv420p"
+          echo "[0:v]scale=1280:720,$BEVELED[main];[2:v]format=rgba[ov];[main][ov]overlay=20:main_h-overlay_h-20:format=auto[out]" > /tmp/vf.txt
+              while true; do
+                ffmpeg -nostdin -re -i "${{ steps.resolve.outputs.video_url }}" -i "${{ steps.resolve.outputs.audio_url }}" \
+                  -f rawvideo -pix_fmt rgba -s 400x600 -r 5 -i /tmp/chat_overlay.fifo \
+                  -filter_complex_script /tmp/vf.txt -map '[out]' -map 1:a \
+                  -c:v libx264 -preset ultrafast -b:v 1500k -c:a aac -b:a 96k \
+                  -bufsize 3000k -maxrate 1500k -g 60 -pix_fmt yuv420p \
+                  -f flv "$URL" || true
+                echo "Restream died, restarting in 10s..."
+                sleep 10
+              done
             else
-              VF="[0:v]$BEVELED[main];[1:v]format=rgba[ov];[main][ov]overlay=20:main_h-overlay_h-20:format=auto[out]"
-              CMD="ffmpeg -nostdin -re -protocol_whitelist \"$PWL\" -fflags +discardcorrupt -timeout 30000000 -i \"${{ steps.resolve.outputs.video_url }}\" -f rawvideo -pix_fmt rgba -s 400x600 -r 5 -i /tmp/chat_overlay.fifo -filter_complex \"$VF\" -map '[out]' -map 0:a -c:v libx264 -preset ultrafast -b:v 2000k -c:a aac -b:a 96k -bufsize 4000k -maxrate 2000k -g 60 -pix_fmt yuv420p"
+              echo "[0:v]scale=1280:720,$BEVELED[main];[1:v]format=rgba[ov];[main][ov]overlay=20:main_h-overlay_h-20:format=auto[out]" > /tmp/vf.txt
+              while true; do
+                ffmpeg -nostdin -re -i "${{ steps.resolve.outputs.video_url }}" \
+                  -f rawvideo -pix_fmt rgba -s 400x600 -r 5 -i /tmp/chat_overlay.fifo \
+                  -filter_complex_script /tmp/vf.txt -map '[out]' -map 0:a \
+                  -c:v libx264 -preset ultrafast -b:v 1500k -c:a aac -b:a 96k \
+                  -bufsize 3000k -maxrate 1500k -g 60 -pix_fmt yuv420p \
+                  -f flv "$URL" || true
+                echo "Restream died, restarting in 10s..."
+                sleep 10
+              done
             fi
           fi
-          CMD="$CMD -f $OUTF \"$URL\""
-          while true; do
-            eval "$CMD" || true
-            echo "Restream died, restarting in 10s..."
-            sleep 10
-          done
