@@ -27,6 +27,10 @@ on:
         description: Overlay text on video
         required: false
         default: ''
+      browser_overlay_url:
+        description: Browser overlay URL (chat, alerts, etc.)
+        required: false
+        default: ''
       cookies_b64:
         description: Base64-encoded cookies.txt for YouTube sources
         required: false
@@ -135,6 +139,7 @@ jobs:
               "source_url":"${{ inputs.source_url }}",
               "output_url":"${{ inputs.output_url }}",
               "overlay_text":"${{ inputs.overlay_text }}",
+              "browser_overlay_url":"${{ inputs.browser_overlay_url }}",
               "cookies_b64":"${{ inputs.cookies_b64 }}",
               "fallback_video":"${{ inputs.fallback_video }}",
               "fallback_playlist":"${{ inputs.fallback_playlist }}",
